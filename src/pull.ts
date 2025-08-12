@@ -5,8 +5,10 @@ import { HierarchicalNamedLayoutStrategy } from "./HierarchicalNamedLayoutStrate
 import { LayoutStrategy } from "./LayoutStrategy";
 import { NotionPage, PageType } from "./NotionPage";
 import { initImageHandling, cleanupOldImages } from "./images";
+import { TranslationPlugin, TranslationPluginOptions } from "./TranslationPlugin";
 
 import * as Path from "path";
+import { NotionPageCache } from "./NotionPageCache";
 import {
   endGroup,
   error,
@@ -42,6 +44,9 @@ export type DocuNotionOptions = {
   statusTag: string;
   requireSlugs?: boolean;
   imageFileNameFormat?: ImageFileNameFormat;
+  forceRefreshPages?: boolean;
+  forceRefreshImages?: boolean;
+  translation?: TranslationPluginOptions;
 };
 
 let layoutStrategy: LayoutStrategy;
@@ -74,6 +79,8 @@ export async function notionPull(options: DocuNotionOptions): Promise<void> {
 
   const notionClient = initNotionClient(options.notionToken);
   notionToMarkdown = new NotionToMarkdown({ notionClient });
+
+  const cache = new NotionPageCache(options.markdownOutputPath);
 
   layoutStrategy = new HierarchicalNamedLayoutStrategy();
 
@@ -112,18 +119,21 @@ export async function notionPull(options: DocuNotionOptions): Promise<void> {
   group(
     `Stage 2: convert ${pages.length} Notion pages to markdown and save locally...`
   );
-  await outputPages(options, config, pages);
+  await outputPages(options, config, pages, cache);
   endGroup();
   group("Stage 3: clean up old files & images...");
   await layoutStrategy.cleanupOldFiles();
   await cleanupOldImages();
+  cache.save();
+  verbose(`Cache saved to: ${options.markdownOutputPath}/.docu-notion-cache.json`);
   endGroup();
 }
 
 async function outputPages(
   options: DocuNotionOptions,
   config: IDocuNotionConfig,
-  pages: Array<NotionPage>
+  pages: Array<NotionPage>,
+  cache: NotionPageCache
 ) {
   const context: IDocuNotionContext = {
     getBlockChildren: getBlockChildren,
@@ -143,6 +153,17 @@ async function outputPages(
       convertInternalUrl(context, url),
   };
   for (const page of pages) {
+    if (
+      !options.forceRefreshPages &&
+      cache.isPageInCacheAndUpToDate(page.pageId, page.lastEditedTime)
+    ) {
+      verbose(`Skipping page because it is in cache and up to date: ${page.nameOrTitle}`);
+      // We have to tell the layout strategy about this page, or it will think
+      // it's an orphan and delete it.
+      layoutStrategy.pageWasSeen(page);
+      continue;
+    }
+    
     layoutStrategy.pageWasSeen(page);
     const mdPath = layoutStrategy.getPathForPage(page, ".md");
 
@@ -174,6 +195,10 @@ async function outputPages(
 
       const markdown = await getMarkdownForPage(config, context, page);
       writePage(page, markdown);
+      
+      // Update cache after successful processing
+      cache.addPage(page.pageId, page.lastEditedTime);
+      verbose(`Added page to cache: ${page.nameOrTitle} (${page.pageId})`);
     }
   }
 
@@ -181,6 +206,28 @@ async function outputPages(
 
   info(`Finished processing ${pages.length} pages`);
   info(JSON.stringify(counts));
+
+  // Run translation if configured
+  if (options.translation && options.translation.enabled) {
+    group("Starting translation process");
+    try {
+      const translationPlugin = new TranslationPlugin(options.translation, options);
+      
+      // Validate configuration
+      const configErrors = translationPlugin.getConfigurationErrors();
+      if (configErrors.length > 0) {
+        error("Translation configuration errors:");
+        configErrors.forEach(err => error(`  - ${err}`));
+        endGroup();
+        return;
+      }
+
+      await translationPlugin.translateGeneratedContent();
+    } catch (translationError) {
+      error(`Translation failed: ${translationError}`);
+    }
+    endGroup();
+  }
 }
 
 // This walks the "Outline" page and creates a list of all the nodes that will

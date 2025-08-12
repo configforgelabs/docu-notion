@@ -1,4 +1,6 @@
 import * as fs from "fs-extra";
+import * as Path from "path";
+import * as crypto from "crypto";
 import FileType, { FileTypeResult } from "file-type";
 import { makeImagePersistencePlan } from "./MakeImagePersistencePlan";
 import { logDebug, verbose } from "./log";
@@ -113,18 +115,42 @@ async function processImageBlock(
   const imageSet = parseImageBlock(imageBlock);
   imageSet.pageInfo = context.pageInfo;
 
-  // enhance: it would much better if we could split the changes to markdown separately from actual reading/writing,
-  // so that this wasn't part of the markdown-creation loop. It's already almost there; we just need to
-  // save the imageSets somewhere and then do the actual reading/writing later.
-  await readPrimaryImage(imageSet);
-  makeImagePersistencePlan(
-    context.options,
-    imageSet,
-    block.id,
-    imageOutputPath,
-    imagePrefix
-  );
-  await saveImage(imageSet);
+  // First, try to determine the filename without downloading
+  const canDetermineFilenameEarly = context.options.imageFileNameFormat !== "content-hash";
+  
+  if (canDetermineFilenameEarly) {
+    // For "default" and "legacy" modes, we can determine filename from URL/block ID
+    makeImagePersistencePlanWithoutBuffer(
+      context.options,
+      imageSet,
+      block.id,
+      imageOutputPath,
+      imagePrefix
+    );
+    
+    // Check if the primary image already exists
+    if (!context.options.forceRefreshImages && imageSet.primaryFileOutputPath && fs.existsSync(imageSet.primaryFileOutputPath)) {
+      verbose(`Primary image already exists, skipping download: ${imageSet.primaryFileOutputPath}`);
+      imageWasSeen(imageSet.primaryFileOutputPath);
+      // We still need to process localized images, but can skip primary download
+      await saveLocalizedImages(imageSet, context);
+    } else {
+      // Download and save as usual
+      await readPrimaryImage(imageSet);
+      await saveImage(imageSet, context);
+    }
+  } else {
+    // For "content-hash" mode, we need to download first to generate hash-based filename
+    await readPrimaryImage(imageSet);
+    makeImagePersistencePlan(
+      context.options,
+      imageSet,
+      block.id,
+      imageOutputPath,
+      imagePrefix
+    );
+    await saveImage(imageSet, context);
+  }
 
   // change the src to point to our copy of the image
   if ("file" in imageBlock) {
@@ -161,25 +187,53 @@ async function readPrimaryImage(imageSet: ImageSet) {
   imageSet.fileType = await FileType.fromBuffer(imageSet.primaryBuffer);
 }
 
-async function saveImage(imageSet: ImageSet): Promise<void> {
-  const path = imageSet.primaryFileOutputPath!;
-  imageWasSeen(path);
-  writeAsset(path, imageSet.primaryBuffer!);
+// Create a lightweight version of makeImagePersistencePlan that doesn't need the buffer
+function makeImagePersistencePlanWithoutBuffer(
+  options: any,
+  imageSet: ImageSet,
+  imageBlockId: string,
+  imageOutputRootPath: string,
+  imagePrefix: string
+): void {
+  const urlBeforeQuery = imageSet.primaryUrl.split("?")[0];
+  
+  // Try to get the extension from the url first
+  let imageFileExtension = urlBeforeQuery.split(".").pop();
+  
+  if (!imageFileExtension) {
+    // Fallback to common image extensions if we can't determine from URL
+    imageFileExtension = "png"; // Most screenshots are PNG
+  }
 
+  if (options.imageFileNameFormat === "legacy") {
+    // Same logic as in MakeImagePersistencePlan.ts
+    const thingToHash = findLastUuid(urlBeforeQuery) ?? urlBeforeQuery;
+    const hash = hashOfString(thingToHash);
+    imageSet.outputFileName = `${hash}.${imageFileExtension}`;
+  } else {
+    // Default format: page slug + block ID
+    const pageSlugPart = imageSet.pageInfo?.slug
+      ? `${imageSet.pageInfo.slug.replace(/^\//, "")}.`
+      : "";
+    imageSet.outputFileName = `${pageSlugPart}${imageBlockId}.${imageFileExtension}`;
+  }
+
+  imageSet.primaryFileOutputPath = Path.posix.join(
+    imageOutputRootPath?.length > 0
+      ? imageOutputRootPath
+      : imageSet.pageInfo!.directoryContainingMarkdown,
+    decodeURI(imageSet.outputFileName)
+  );
+
+  imageSet.filePathToUseInMarkdown =
+    (imagePrefix?.length > 0 ? imagePrefix : ".") +
+    "/" +
+    imageSet.outputFileName;
+}
+
+// Helper function to handle only localized images
+async function saveLocalizedImages(imageSet: ImageSet, context: IDocuNotionContext): Promise<void> {
   for (const localizedImage of imageSet.localizedUrls) {
-    let buffer = imageSet.primaryBuffer!;
-    // if we have a url for the localized screenshot, download it
-    if (localizedImage?.url.length > 0) {
-      verbose(`Retrieving ${localizedImage.iso632Code} version...`);
-      const response = await fetch(localizedImage.url);
-      const arrayBuffer = await response.arrayBuffer();
-      buffer = Buffer.from(arrayBuffer);
-    } else {
-      verbose(
-        `No localized image specified for ${localizedImage.iso632Code}, will use primary image.`
-      );
-      // otherwise, we're going to fall back to outputting the primary image here
-    }
     const directory = `./i18n/${
       localizedImage.iso632Code
     }/docusaurus-plugin-content-docs/current/${
@@ -190,9 +244,65 @@ async function saveImage(imageSet: ImageSet): Promise<void> {
       "//",
       "/"
     );
+
+    // Always mark the image as seen for cleanup purposes
     imageWasSeen(newPath);
-    writeAsset(newPath, buffer);
+
+    // Check if localized image already exists before downloading/saving
+    if (!context.options.forceRefreshImages && fs.existsSync(newPath)) {
+      verbose(`Localized (${localizedImage.iso632Code}) image already exists, skipping: ${newPath}`);
+    } else {
+      let buffer = imageSet.primaryBuffer!;
+      
+      // if we have a url for the localized screenshot, download it
+      if (localizedImage?.url.length > 0) {
+        verbose(`Retrieving ${localizedImage.iso632Code} version...`);
+        const response = await fetch(localizedImage.url);
+        const arrayBuffer = await response.arrayBuffer();
+        buffer = Buffer.from(arrayBuffer);
+      } else {
+        verbose(
+          `No localized image specified for ${localizedImage.iso632Code}, will use primary image.`
+        );
+        // For fallback to primary image, we need the primary buffer
+        // If we don't have it yet (because we skipped download), we need to download it
+        if (!imageSet.primaryBuffer) {
+          await readPrimaryImage(imageSet);
+        }
+        buffer = imageSet.primaryBuffer!;
+      }
+
+      writeAsset(newPath, buffer);
+      verbose(`Saved localized (${localizedImage.iso632Code}) image: ${newPath}`);
+    }
   }
+}
+
+// Helper functions from MakeImagePersistencePlan.ts
+function findLastUuid(url: string): string | null {
+  const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+  const matches = url.match(uuidRegex);
+  return matches ? matches[matches.length - 1] : null;
+}
+
+function hashOfString(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex").substring(0, 8);
+}
+
+async function saveImage(imageSet: ImageSet, context: IDocuNotionContext): Promise<void> {
+  // Save primary image
+  const primaryPath = imageSet.primaryFileOutputPath!;
+  imageWasSeen(primaryPath); // Always mark as seen for cleanup purposes
+  
+  if (!context.options.forceRefreshImages && fs.existsSync(primaryPath)) {
+    verbose(`Primary image already exists, skipping: ${primaryPath}`);
+  } else {
+    writeAsset(primaryPath, imageSet.primaryBuffer!);
+    verbose(`Saved primary image: ${primaryPath}`);
+  }
+
+  // Save localized images
+  await saveLocalizedImages(imageSet, context);
 }
 
 export function parseImageBlock(image: any): ImageSet {

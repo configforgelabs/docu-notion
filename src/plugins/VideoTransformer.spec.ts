@@ -162,4 +162,4 @@ test("direct upload to to Notion (embedded)", async () => {
   // We should have actually created files in "tempTestFileDir/"
   expect(await fs.pathExists("tempTestFileDir/" + fileName1)).toBe(true);
   expect(await fs.pathExists("tempTestFileDir/" + fileName2)).toBe(true);
-});
+}, 15000); // Increase timeout to 15 seconds for video downloads

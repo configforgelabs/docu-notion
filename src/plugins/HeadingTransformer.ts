@@ -3,19 +3,35 @@ import { NotionBlock } from "../types";
 import { IPlugin } from "./pluginTypes";
 import { logDebug } from "../log";
 
-// Makes links to headings work in docusaurus
+// Makes links to headings work in docusaurus and shifts heading levels down by one
+// H1 becomes H2, H2 becomes H3, etc. This allows using frontmatter title instead of H1 in content
 // https://github.com/sillsdev/docu-notion/issues/20
-async function headingTransformer(
+async function headingTransformerWithLevelShift(
   notionToMarkdown: NotionToMarkdown,
-  block: NotionBlock
+  block: NotionBlock,
+  targetLevel: number
 ): Promise<string> {
-  // First, remove the prefix we added to the heading type
-  (block as any).type = block.type.replace("DN_", "");
+  // Create a copy of the block and modify its type and properties to the target level
+  const modifiedBlock = { ...block };
+  const originalLevel = parseInt(block.type.replace('DN_heading_', ''));
+  
+  // Set the new type
+  (modifiedBlock as any).type = `heading_${targetLevel}`;
+  
+  // Copy the heading data from the original level to the target level
+  const headingKey = `heading_${originalLevel}` as keyof typeof block;
+  const targetHeadingKey = `heading_${targetLevel}`;
+  
+  if (block[headingKey]) {
+    (modifiedBlock as any)[targetHeadingKey] = block[headingKey];
+    // Remove the old heading property to avoid conflicts
+    delete (modifiedBlock as any)[headingKey];
+  }
 
-  const markdown = await notionToMarkdown.blockToMarkdown(block);
+  const markdown = await notionToMarkdown.blockToMarkdown(modifiedBlock);
 
   logDebug(
-    "headingTransformer, markdown of a heading before adding id",
+    "headingTransformerWithLevelShift, markdown of a heading before adding id",
     markdown
   );
 
@@ -48,22 +64,34 @@ export const standardHeadingTransformer: IPlugin = {
       },
     },
   ],
-  // then when it comes time to do markdown conversions, we'll get called for each of these
+  // Add support for heading level 4 that notion-to-md doesn't support by default
+  // Only H1-H3 from Notion are supported, which become H2-H4 in the output
   notionToMarkdownTransforms: [
+    // First, register the missing heading_4 transformer that notion-to-md doesn't have
+    {
+      type: "heading_4",
+      getStringFromBlock: async (context, block) => {
+        const headingData = (block as any).heading_4;
+        const text = headingData?.rich_text?.map((t: any) => t.plain_text).join('') || '';
+        return `#### ${text}`;
+      },
+    },
+    // Now register our custom transformers that shift heading levels down by one
+    // Notion H1 -> Markdown H2, Notion H2 -> Markdown H3, Notion H3 -> Markdown H4
     {
       type: "DN_heading_1",
       getStringFromBlock: (context, block) =>
-        headingTransformer(context.notionToMarkdown, block),
+        headingTransformerWithLevelShift(context.notionToMarkdown, block, 2), // H1 becomes H2
     },
     {
       type: "DN_heading_2",
       getStringFromBlock: (context, block) =>
-        headingTransformer(context.notionToMarkdown, block),
+        headingTransformerWithLevelShift(context.notionToMarkdown, block, 3), // H2 becomes H3
     },
     {
       type: "DN_heading_3",
       getStringFromBlock: (context, block) =>
-        headingTransformer(context.notionToMarkdown, block),
+        headingTransformerWithLevelShift(context.notionToMarkdown, block, 4), // H3 becomes H4
     },
   ],
 };

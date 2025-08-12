@@ -69,6 +69,16 @@ export async function run(): Promise<void> {
       )
         .choices(["default", "content-hash", "legacy"])
         .default("default")
+    )
+    .option(
+      "--force-refresh-pages",
+      "If set, docu-notion will re-download and re-process all pages, even if they already exist and are up to date in the cache.",
+      false
+    )
+    .option(
+      "--force-refresh-images",
+      "If set, docu-notion will re-download all images, even if they already exist on disk.",
+      false
     );
 
   program.showHelpAfterError();
